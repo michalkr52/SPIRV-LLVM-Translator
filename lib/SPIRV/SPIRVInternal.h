@@ -510,6 +510,7 @@ public:
   virtual void init(StringRef UniqUnmangledName) {
     UnmangledName = UniqUnmangledName.str();
   }
+  virtual bool isOpenCL() const { return false; }
 
 protected:
   std::string UnmangledName;

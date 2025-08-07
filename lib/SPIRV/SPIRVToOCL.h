@@ -251,6 +251,8 @@ public:
   // Transform FP atomic opcode to corresponding OpenCL function name
   virtual std::string mapFPAtomicName(Op OC) = 0;
 
+  static std::string translateOpaqueType(StringRef STName);
+
   void translateOpaqueTypes();
 
 private:
@@ -279,8 +281,6 @@ private:
   /// example: spirv.Pipe._0 => opencl.pipe_ro_t
   static std::string
   getOCLPipeOpaqueType(SmallVector<std::string, 8> &Postfixes);
-
-  static std::string translateOpaqueType(StringRef STName);
 
   /// Mutate the call instruction based on (optional) image operands at position
   /// ImOpArgIndex. The new function name will be based on NewFuncName, and the

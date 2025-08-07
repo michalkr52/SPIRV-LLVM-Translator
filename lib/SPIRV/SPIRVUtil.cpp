@@ -49,6 +49,7 @@
 #include "ParameterType.h"
 #include "SPIRVInternal.h"
 #include "SPIRVMDWalker.h"
+#include "SPIRVToOCL.h"
 #include "libSPIRV/SPIRVDecorate.h"
 #include "libSPIRV/SPIRVValue.h"
 
@@ -1303,11 +1304,34 @@ SPIR::TypePrimitiveEnum getOCLTypePrimitiveEnum(StringRef TyName) {
             SPIR::PRIMITIVE_SUB_GROUP_AVC_IME_DUAL_REF_STREAMIN_T)
       .Default(SPIR::PRIMITIVE_NONE);
 }
+
+/// Get TypePrimitiveEnum for special OpenCL type from TargetExtType.
+static SPIR::TypePrimitiveEnum getOCLTypePrimitiveEnum(TargetExtType *Ty) {
+  if (Ty->getName() == "spirv.Image") {
+    std::string SPIRVName;
+    {
+      Type *InnerType = Ty->getTypeParameter(0);
+      raw_string_ostream OS(SPIRVName);
+      OS << kSPIRVTypeName::PrefixAndDelim
+         << SPIRVOpaqueTypeOpCodeMap::rmap(OpTypeImage) << "._"
+         << (InnerType ? convertTypeToPostfix(InnerType) : "void");
+      for (unsigned IntParam : Ty->int_params())
+        OS << kSPIRVTypeName::PostfixDelim << IntParam;
+    }
+    std::string OpenCLName = SPIRVToOCLBase::translateOpaqueType(SPIRVName);
+    return getOCLTypePrimitiveEnum(OpenCLName);
+  }
+
+  return SPIR::PRIMITIVE_NONE;
+}
+
 /// Translates LLVM type to descriptor for mangler.
 /// \param Signed indicates integer type should be translated as signed.
 /// \param VoidPtr indicates i8* should be translated as void*.
 static SPIR::RefParamType transTypeDesc(Type *Ty,
-                                        const BuiltinArgTypeMangleInfo &Info) {
+                                        const BuiltinArgTypeMangleInfo &Info,
+                                        bool IsOpenCL,
+                                        StringRef InstName = "") {
   bool Signed = Info.IsSigned;
   unsigned Attr = Info.Attr;
   bool VoidPtr = Info.IsVoidPtr;
@@ -1322,7 +1346,8 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
   if (Info.IsAtomic && !isa<TypedPointerType>(Ty)) {
     BuiltinArgTypeMangleInfo DTInfo = Info;
     DTInfo.IsAtomic = false;
-    return SPIR::RefParamType(new SPIR::AtomicType(transTypeDesc(Ty, DTInfo)));
+    return SPIR::RefParamType(
+        new SPIR::AtomicType(transTypeDesc(Ty, DTInfo, IsOpenCL)));
   }
   if (auto *IntTy = dyn_cast<IntegerType>(Ty)) {
     switch (IntTy->getBitWidth()) {
@@ -1356,11 +1381,12 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
     return SPIR::RefParamType(new SPIR::PrimitiveType(SPIR::PRIMITIVE_BFLOAT));
   if (auto *VecTy = dyn_cast<FixedVectorType>(Ty)) {
     return SPIR::RefParamType(new SPIR::VectorType(
-        transTypeDesc(VecTy->getElementType(), Info), VecTy->getNumElements()));
+        transTypeDesc(VecTy->getElementType(), Info, IsOpenCL),
+        VecTy->getNumElements()));
   }
   if (Ty->isArrayTy()) {
     return transTypeDesc(TypedPointerType::get(Ty->getArrayElementType(), 0),
-                         Info);
+                         Info, IsOpenCL);
   }
   if (Ty->isStructTy()) {
     auto Name = Ty->getStructName();
@@ -1387,6 +1413,13 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
     return SPIR::RefParamType(new SPIR::UserDefinedType(Name.str()));
   }
   if (auto *TargetTy = dyn_cast<TargetExtType>(Ty)) {
+    if (IsOpenCL) {
+      SPIR::TypePrimitiveEnum TPE = getOCLTypePrimitiveEnum(TargetTy);
+      if (TPE != SPIR::PRIMITIVE_NONE) {
+        return SPIR::RefParamType(
+            new SPIR::PrimitiveType(getOCLTypePrimitiveEnum(TargetTy)));
+      }
+    }
     std::string FullName;
     unsigned AS = 0;
     {
@@ -1413,42 +1446,20 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
         AS + (unsigned)SPIR::ATTR_ADDR_SPACE_FIRST));
     return SPIR::RefParamType(PT);
   }
-
-  if (auto *TargetTy = dyn_cast<TargetExtType>(Ty)) {
-    std::string FullName;
-    unsigned AS = 0;
-    {
-      raw_string_ostream OS(FullName);
-      StringRef Name = TargetTy->getName();
-      if (Name.consume_front(kSPIRVTypeName::PrefixAndDelim)) {
-        OS << "__spirv_" << Name;
-        AS = getOCLOpaqueTypeAddrSpace(
-            SPIRVOpaqueTypeOpCodeMap::map(Name.str()));
-      } else {
-        OS << Name;
-      }
-      if (!TargetTy->int_params().empty())
-        OS << "_";
-      for (Type *InnerTy : TargetTy->type_params())
-        OS << "_" << convertTypeToPostfix(InnerTy);
-      for (unsigned Param : TargetTy->int_params())
-        OS << "_" << Param;
-    }
-    // Translate as if it's a pointer to the named struct.
-    auto *Inner = new SPIR::UserDefinedType(FullName);
-    auto *PT = new SPIR::PointerType(Inner);
-    PT->setAddressSpace(static_cast<SPIR::TypeAttributeEnum>(
-        AS + (unsigned)SPIR::ATTR_ADDR_SPACE_FIRST));
-    return SPIR::RefParamType(PT);
-  }
-
   if (auto *TPT = dyn_cast<TypedPointerType>(Ty)) {
     auto *ET = TPT->getElementType();
     SPIR::ParamType *EPT = nullptr;
     if (isa<FunctionType>(ET)) {
-      assert(isVoidFuncTy(cast<FunctionType>(ET)) && "Not supported");
-      EPT = new SPIR::BlockType;
-    } else if (auto StructTy = dyn_cast<StructType>(ET)) {
+      FunctionType *FT = cast<FunctionType>(ET);
+      if (InstName.consume_front(kSPIRVName::Prefix) &&
+          InstName.starts_with("TaskSequence")) {
+        EPT = new SPIR::PointerType(
+            transTypeDesc(FT->getReturnType(), Info, IsOpenCL));
+      } else {
+        assert((isVoidFuncTy(FT)) && "Not supported");
+        EPT = new SPIR::BlockType;
+      }
+    } else if (auto *StructTy = dyn_cast<StructType>(ET)) {
       LLVM_DEBUG(dbgs() << "ptr to struct: " << *Ty << '\n');
       auto TyName = StructTy->getStructName();
       if (TyName.startswith(kSPR2TypeName::OCLPrefix)) {
@@ -1497,7 +1508,7 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
 
     if (VoidPtr && ET->isIntegerTy(8))
       ET = Type::getVoidTy(ET->getContext());
-    auto *PT = new SPIR::PointerType(transTypeDesc(ET, Info));
+    auto *PT = new SPIR::PointerType(transTypeDesc(ET, Info, IsOpenCL));
     PT->setAddressSpace(static_cast<SPIR::TypeAttributeEnum>(
         TPT->getAddressSpace() + (unsigned)SPIR::ATTR_ADDR_SPACE_FIRST));
     for (unsigned I = SPIR::ATTR_QUALIFIER_FIRST, E = SPIR::ATTR_QUALIFIER_LAST;
@@ -1809,8 +1820,8 @@ std::string mangleBuiltin(StringRef UniqName, ArrayRef<Type *> ArgTypes,
       if (MangleInfo.PointerTy && T->isPointerTy()) {
         T = MangleInfo.PointerTy;
       }
-      FD.Parameters.emplace_back(
-          transTypeDesc(T, BtnInfo->getTypeMangleInfo(I)));
+      FD.Parameters.emplace_back(transTypeDesc(T, BtnInfo->getTypeMangleInfo(I),
+                                               BtnInfo->isOpenCL(), UniqName));
     }
   }
   // Ellipsis must be the last argument of any function
