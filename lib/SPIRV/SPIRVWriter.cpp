@@ -894,8 +894,65 @@ SPIRVFunction *LLVMToSPIRVBase::transFunctionDecl(Function *F) {
     return nullptr;
   }
 
-  SPIRVTypeFunction *BFT =
-      static_cast<SPIRVTypeFunction *>(transScavengedType(F));
+  SPIRVTypeFunction *BFT = nullptr;
+  // In LLVM 16 OCL types are emitted as opaque pointers instead of
+  // TargetExtTy, which causes them to lose additional attributes
+  // when translated, such as access qualifiers or image dimensions. 
+  // Manually resolve argument types, relying on metadata.
+  if (auto ArgTypeMD = F->getMetadata("kernel_arg_type")) {
+    std::vector<SPIRVType *> ParamTypes;
+    for (Function::arg_iterator I = F->arg_begin(), E = F->arg_end(); I != E;
+         ++I) {
+      auto ArgNo = I->getArgNo();
+      llvm::StringRef ArgType = getMDOperandAsString(ArgTypeMD, ArgNo);
+      auto ArgAccessQualMD = F->getMetadata("kernel_arg_access_qual");
+      llvm::StringRef ArgAccessQual =
+          getMDOperandAsString(ArgAccessQualMD, ArgNo);
+
+      if (ArgType.starts_with("image")) {
+        SPIRVTypeImageDescriptor Desc(parseImageDimension(ArgType), 0, 0, 0, 0,
+                                      0);
+        if (ArgType.contains("depth"))
+          Desc.Depth = 1;
+        if (ArgType.contains("array"))
+          Desc.Arrayed = 1;
+        if (ArgType.contains("msaa"))
+          Desc.MS = 1;
+
+        SPIRVType *SampledType = transType(Type::getVoidTy(M->getContext()));
+        SPIRSPIRVAccessQualifierMap AccessQualMap;
+        SPIRVAccessQualifierKind AccessQual =
+            AccessQualMap.map(ArgAccessQual.str());
+
+        // TODO: addImageType duplicates image arguments if they are the same
+        SPIRVTypeImage *ImageType =
+            BM->addImageType(SampledType, Desc, AccessQual);
+        ParamTypes.push_back(ImageType);
+      } else if (ArgType.starts_with("sampler")) {
+        SPIRVTypeSampler *SamplerType = BM->addSamplerType();
+        ParamTypes.push_back(SamplerType);
+      } else if (ArgType.starts_with("queue")) {
+        SPIRVTypeQueue *QueueType = BM->addQueueType();
+        ParamTypes.push_back(QueueType);
+      } else if (ArgType.starts_with("clk_event")) {
+        SPIRVTypeDeviceEvent *DeviceEventType = BM->addDeviceEventType();
+        ParamTypes.push_back(DeviceEventType);
+      } else if (ArgType.starts_with("reserve_id")) {
+        // TODO
+      } else if (ArgType.starts_with("event")) {
+        // TODO
+      } else {
+        ParamTypes.push_back(transType(I->getType()));
+      }
+    }
+
+    SPIRVType *ReturnType = transType(F->getReturnType());
+    BFT = static_cast<SPIRVTypeFunction *>(
+        getSPIRVFunctionType(ReturnType, ParamTypes));
+  } else {
+    BFT = static_cast<SPIRVTypeFunction *>(transScavengedType(F));
+  }
+
   SPIRVFunction *BF =
       static_cast<SPIRVFunction *>(mapValue(F, BM->addFunction(BFT)));
   BF->setFunctionControlMask(transFunctionControlMask(F));

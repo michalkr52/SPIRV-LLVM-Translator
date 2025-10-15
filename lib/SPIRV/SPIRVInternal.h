@@ -1040,6 +1040,9 @@ bool postProcessBuiltinsReturningStruct(Module *M, bool IsCpp = false);
 
 bool postProcessBuiltinsWithArrayArguments(Module *M, bool IsCpp = false);
 
+// Parse argument image type string to image dimensions.
+SPIRVImageDimKind parseImageDimension(llvm::StringRef ArgType);
+
 template <typename T>
 MetadataAsValue *map2MDString(LLVMContext &C, SPIRVValue *V);
 } // namespace SPIRV

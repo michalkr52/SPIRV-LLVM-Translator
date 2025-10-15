@@ -2431,6 +2431,19 @@ bool postProcessBuiltinsWithArrayArguments(Module *M, bool IsCpp) {
   return true;
 }
 
+SPIRVImageDimKind parseImageDimension(llvm::StringRef ArgType) {
+  if (ArgType.contains("1d_buffer"))
+    return SPIRVImageDimKind::DimBuffer;
+  else if (ArgType.contains("1d"))
+    return SPIRVImageDimKind::Dim1D;
+  else if (ArgType.contains("2d"))
+    return SPIRVImageDimKind::Dim2D;
+  else if (ArgType.contains("3d"))
+    return SPIRVImageDimKind::Dim3D;
+  else
+    return SPIRVImageDimKind::Dim2D; // Fallback to 2D
+}
+
 } // namespace SPIRV
 
 namespace {
